@@ -62,7 +62,7 @@ fig_map = px.choropleth(
     locations="country",
     locationmode="country names",
     color="mentions",
-    color_continuous_scale="Reds",
+    color_continuous_scale="Viridis",
     title="Country Mentions in Presidential Speeches"
 )
 
