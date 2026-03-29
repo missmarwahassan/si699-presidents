@@ -2,13 +2,29 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+from openai import OpenAI
+
+# -----------------------------
+# PAGE CONFIG
+# -----------------------------
 st.set_page_config(layout="wide")
-
-st.title("Presidential Speech Geographic Mentions")
+st.title("🇺🇸 Presidential Speech Analysis + AI Insights")
 
 # -----------------------------
-# Load data
+# OPENAI CLIENT (NEW API)
 # -----------------------------
+client = OpenAI(api_key=st.secrets.get("OPENAI_API_KEY", ""))
+
+# -----------------------------
+# LOAD DATA
+# -----------------------------
+@st.cache_data
+def load_documents():
+    return pd.read_pickle("documents.pkl")
+
 @st.cache_data
 def load_country_data():
     return pd.read_csv("country_mentions_counts.csv")
@@ -17,38 +33,101 @@ def load_country_data():
 def load_state_data():
     return pd.read_csv("state_mentions_counts.csv")
 
+documents = load_documents()
 country_df = load_country_data()
 state_df = load_state_data()
 
 # -----------------------------
-# Shared Filters
+# BUILD TF-IDF
+# -----------------------------
+@st.cache_data
+def build_vectorizer(documents):
+    texts = documents["text"].fillna("").tolist()
+
+    vectorizer = TfidfVectorizer(
+        stop_words="english",
+        max_features=5000
+    )
+
+    matrix = vectorizer.fit_transform(texts)
+    return vectorizer, matrix
+
+vectorizer, tfidf_matrix = build_vectorizer(documents)
+
+# -----------------------------
+# RETRIEVAL FUNCTION
+# -----------------------------
+def retrieve_docs(query, president=None, k=5):
+    query_vec = vectorizer.transform([query])
+    scores = cosine_similarity(query_vec, tfidf_matrix).flatten()
+
+    top_indices = scores.argsort()[-k:][::-1]
+
+    results = []
+    for i in top_indices:
+        row = documents.iloc[i]
+
+        if president:
+            if president.lower() not in row["president"].lower():
+                continue
+
+        results.append({
+            "text": row["text"][:200],  # keep cheap
+            "president": row["president"],
+            "date": row["date"]
+        })
+
+    return results
+
+# -----------------------------
+# GPT CALL (UPDATED API)
+# -----------------------------
+@st.cache_data(show_spinner=False)
+def generate_answer(context, question):
+
+    prompt = f"""
+Context:
+{context}
+
+Question:
+{question}
+
+Analyze how presidents discuss this topic.
+Highlight tone, priorities, and key differences.
+Do NOT copy sentences directly.
+"""
+
+    response = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "You are a political analyst specializing in U.S. presidential speeches."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.5,
+        max_tokens=300
+    )
+
+    return response.choices[0].message.content
+
+# -----------------------------
+# SIDEBAR FILTERS
 # -----------------------------
 st.sidebar.header("Filters")
 
-# combine presidents from both datasets
-all_presidents = sorted(
-    list(set(country_df["president"]).union(set(state_df["president"])))
-)
+presidents = sorted(country_df["president"].unique())
 
 selected_president = st.sidebar.selectbox(
     "Select President",
-    ["All Presidents"] + all_presidents
+    ["All Presidents"] + presidents
 )
-
-# combine year ranges
-min_year = int(min(country_df.year.min(), state_df.year.min()))
-max_year = int(max(country_df.year.max(), state_df.year.max()))
 
 year_range = st.sidebar.slider(
     "Year Range",
-    min_year,
-    max_year,
-    (min_year, max_year)
+    int(country_df.year.min()),
+    int(country_df.year.max()),
+    (int(country_df.year.min()), int(country_df.year.max()))
 )
 
-# -----------------------------
-# Filter function
-# -----------------------------
 def apply_filters(df):
     filtered = df.copy()
 
@@ -63,43 +142,35 @@ def apply_filters(df):
     return filtered
 
 # -----------------------------
-# Tabs
+# TABS
 # -----------------------------
-tab1, tab2 = st.tabs(["Countries", "US States"])
+tab1, tab2, tab3 = st.tabs([
+    "🌍 Country Analysis",
+    "🇺🇸 State Analysis",
+    "🤖 AI Insights"
+])
 
-# =====================================================
-# 🌍 COUNTRY TAB
-# =====================================================
+# -----------------------------
+# COUNTRY TAB
+# -----------------------------
 with tab1:
-
-    st.header("Countries Mentioned")
+    st.header("Country Mentions")
 
     filtered = apply_filters(country_df)
+    country_counts = filtered.groupby("country")["mentions"].sum().reset_index()
 
-    country_counts = (
-        filtered.groupby("country")["mentions"]
-        .sum()
-        .reset_index()
-    )
-
-    # Map
     fig_map = px.choropleth(
         country_counts,
         locations="country",
         locationmode="country names",
         color="mentions",
-        color_continuous_scale="Viridis",
-        title="Country Mentions"
+        color_continuous_scale="Viridis"
     )
 
     st.plotly_chart(fig_map, use_container_width=True)
 
-    # Top countries
     st.subheader("Top Countries")
-
-    top_countries = country_counts.sort_values(
-        "mentions", ascending=False
-    ).head(15)
+    top_countries = country_counts.sort_values("mentions", ascending=False).head(15)
 
     fig_bar = px.bar(
         top_countries,
@@ -110,81 +181,28 @@ with tab1:
 
     st.plotly_chart(fig_bar, use_container_width=True)
 
-    # Timeline
-    st.subheader("Mentions Over Time")
-
-    timeline = (
-        filtered.groupby("year")["mentions"]
-        .sum()
-        .reset_index()
-    )
-
-    fig_time = px.line(
-        timeline,
-        x="year",
-        y="mentions"
-    )
-
-    st.plotly_chart(fig_time, use_container_width=True)
-
-    # Compare countries
-    st.subheader("Compare Countries")
-
-    countries = sorted(country_df["country"].unique())
-
-    selected_countries = st.multiselect(
-        "Choose countries",
-        countries,
-        default=countries[:2]
-    )
-
-    compare = filtered[
-        filtered["country"].isin(selected_countries)
-    ]
-
-    fig_compare = px.line(
-        compare,
-        x="year",
-        y="mentions",
-        color="country"
-    )
-
-    st.plotly_chart(fig_compare, use_container_width=True)
-
-# =====================================================
-# 🇺🇸 STATE TAB
-# =====================================================
+# -----------------------------
+# STATE TAB
+# -----------------------------
 with tab2:
-
-    st.header("US State Mentions")
+    st.header("State Mentions")
 
     filtered = apply_filters(state_df)
+    state_counts = filtered.groupby("state")["mentions"].sum().reset_index()
 
-    state_counts = (
-        filtered.groupby(["state","abbr"])["mentions"]
-        .sum()
-        .reset_index()
-    )
-
-    # Map
     fig_map = px.choropleth(
         state_counts,
-        locations="abbr",
+        locations="state",
         locationmode="USA-states",
         color="mentions",
         scope="usa",
-        color_continuous_scale="Reds",
-        title="State Mentions"
+        color_continuous_scale="Blues"
     )
 
     st.plotly_chart(fig_map, use_container_width=True)
 
-    # Top states
     st.subheader("Top States")
-
-    top_states = state_counts.sort_values(
-        "mentions", ascending=False
-    ).head(15)
+    top_states = state_counts.sort_values("mentions", ascending=False).head(15)
 
     fig_bar = px.bar(
         top_states,
@@ -195,58 +213,35 @@ with tab2:
 
     st.plotly_chart(fig_bar, use_container_width=True)
 
-    # Timeline
-    st.subheader("Mentions Over Time")
-
-    timeline = (
-        filtered.groupby("year")["mentions"]
-        .sum()
-        .reset_index()
-    )
-
-    fig_time = px.line(
-        timeline,
-        x="year",
-        y="mentions"
-    )
-
-    st.plotly_chart(fig_time, use_container_width=True)
-
-    # Compare states
-    st.subheader("Compare States")
-
-    states = sorted(state_df["state"].unique())
-
-    selected_states = st.multiselect(
-        "Choose states",
-        states,
-        default=states[:2]
-    )
-
-    compare = filtered[
-        filtered["state"].isin(selected_states)
-    ]
-
-    fig_compare = px.line(
-        compare,
-        x="year",
-        y="mentions",
-        color="state"
-    )
-
-    st.plotly_chart(fig_compare, use_container_width=True)
-
 # -----------------------------
-# Dataset Viewer
+# AI INSIGHTS TAB
 # -----------------------------
-st.header("Dataset Preview")
+with tab3:
+    st.header("Ask Questions About Presidential Speeches")
 
-view_option = st.radio(
-    "Choose dataset",
-    ["Countries", "States"]
-)
+    query = st.text_input("Enter your question")
 
-if view_option == "Countries":
-    st.dataframe(country_df)
-else:
-    st.dataframe(state_df)
+    pres_filter = st.text_input("Filter by president (optional)")
+
+    if query:
+        with st.spinner("Analyzing speeches..."):
+
+            docs = retrieve_docs(query, pres_filter if pres_filter else None, k=5)
+
+            if not docs:
+                st.warning("No relevant speeches found.")
+            else:
+                context = "\n\n".join([
+                    f"{d['president']} ({d['date']}): {d['text']}"
+                    for d in docs
+                ])
+
+                answer = generate_answer(context, query)
+
+                st.subheader("Answer")
+                st.write(answer)
+
+                st.subheader("Source Chunks")
+                for d in docs:
+                    st.write(f"**{d['president']} ({d['date']})**")
+                    st.write(d["text"] + "...")
