@@ -1,17 +1,111 @@
 import pandas as pd
 import spacy
 from tqdm import tqdm
+from spacy.matcher import PhraseMatcher
 from presidential_speeches_full import PRESIDENTIAL_SPEECHES
 
-print("Loading spaCy model...")
-nlp = spacy.load("en_core_web_sm")
+# -----------------------------
+# Load spaCy (FAST config)
+# -----------------------------
+print("Loading spaCy...")
+nlp = spacy.load("en_core_web_sm", disable=["parser", "lemmatizer", "textcat"])
 
+# -----------------------------
+# US states
+# -----------------------------
+us_states = {
+    "Alabama":"AL","Alaska":"AK","Arizona":"AZ","Arkansas":"AR","California":"CA",
+    "Colorado":"CO","Connecticut":"CT","Delaware":"DE","Florida":"FL","Georgia":"GA",
+    "Hawaii":"HI","Idaho":"ID","Illinois":"IL","Indiana":"IN","Iowa":"IA",
+    "Kansas":"KS","Kentucky":"KY","Louisiana":"LA","Maine":"ME","Maryland":"MD",
+    "Massachusetts":"MA","Michigan":"MI","Minnesota":"MN","Mississippi":"MS","Missouri":"MO",
+    "Montana":"MT","Nebraska":"NE","Nevada":"NV","New Hampshire":"NH","New Jersey":"NJ",
+    "New Mexico":"NM","New York":"NY","North Carolina":"NC","North Dakota":"ND",
+    "Ohio":"OH","Oklahoma":"OK","Oregon":"OR","Pennsylvania":"PA","Rhode Island":"RI",
+    "South Carolina":"SC","South Dakota":"SD","Tennessee":"TN","Texas":"TX","Utah":"UT",
+    "Vermont":"VT","Virginia":"VA","Washington":"WA","West Virginia":"WV",
+    "Wisconsin":"WI","Wyoming":"WY"
+}
+
+abbr_to_state = {v: k for k, v in us_states.items()}
+
+# -----------------------------
+# PhraseMatcher (VERY FAST)
+# -----------------------------
+matcher = PhraseMatcher(nlp.vocab, attr="LOWER")
+
+patterns = []
+
+for state in us_states:
+    patterns.append(nlp.make_doc(state))
+
+for abbr in us_states.values():
+    patterns.append(nlp.make_doc(abbr))
+
+matcher.add("US_STATES", patterns)
+
+# -----------------------------
+# Disambiguation logic
+# -----------------------------
+def resolve_state(span, doc, person_spans):
+    text = span.text
+    text_lower = text.lower()
+
+    # 🚫 skip PERSON entities (e.g., George Washington)
+    if (span.start, span.end) in person_spans:
+        return None
+
+    # direct matches (fast path)
+    if text in us_states:
+        return text
+    if text in abbr_to_state:
+        return abbr_to_state[text]
+
+    # context window
+    window = doc[max(span.start-4, 0): span.end+4].text.lower()
+
+    # -------------------------
+    # Washington disambiguation
+    # -------------------------
+    if text_lower == "washington":
+
+        # DC
+        if "dc" in window or "d.c" in window:
+            return None
+
+        # Person cues
+        if any(x in window for x in ["george", "president", "general", "mr.", "washington's"]):
+            return None
+
+        # State cues
+        if any(x in window for x in ["state", "seattle", "olympia"]):
+            return "Washington"
+
+        return "Washington"  # default bias
+
+    # -------------------------
+    # Georgia disambiguation
+    # -------------------------
+    if text_lower == "georgia":
+        if any(x in window for x in ["russia", "europe", "soviet"]):
+            return None
+        return "Georgia"
+
+    # -------------------------
+    # New York (state vs city)
+    # -------------------------
+    if text_lower == "new york":
+        return "New York"
+
+    return None
+
+# -----------------------------
+# Load dataset
+# -----------------------------
 print("Loading dataset...")
 df = PRESIDENTIAL_SPEECHES.copy()
 
-# -----------------------------
-# Filter to valid presidents
-# -----------------------------
+# filter presidents
 valid_presidents = [
     "Donald J. Trump (2nd Term)",
     "Joseph R. Biden, Jr.",
@@ -62,66 +156,63 @@ valid_presidents = [
 
 df = df[df["president"].isin(valid_presidents)]
 
-# -----------------------------
-# Date processing
-# -----------------------------
+# dates
 df["date"] = pd.to_datetime(df["date"], errors="coerce")
 df["year"] = df["date"].dt.year
 
 # -----------------------------
-# US states dictionary
+# Processing loop (OPTIMIZED)
 # -----------------------------
-us_states = {
-    "Alabama":"AL","Alaska":"AK","Arizona":"AZ","Arkansas":"AR","California":"CA",
-    "Colorado":"CO","Connecticut":"CT","Delaware":"DE","Florida":"FL","Georgia":"GA",
-    "Hawaii":"HI","Idaho":"ID","Illinois":"IL","Indiana":"IN","Iowa":"IA",
-    "Kansas":"KS","Kentucky":"KY","Louisiana":"LA","Maine":"ME","Maryland":"MD",
-    "Massachusetts":"MA","Michigan":"MI","Minnesota":"MN","Mississippi":"MS","Missouri":"MO",
-    "Montana":"MT","Nebraska":"NE","Nevada":"NV","New Hampshire":"NH","New Jersey":"NJ",
-    "New Mexico":"NM","New York":"NY","North Carolina":"NC","North Dakota":"ND",
-    "Ohio":"OH","Oklahoma":"OK","Oregon":"OR","Pennsylvania":"PA","Rhode Island":"RI",
-    "South Carolina":"SC","South Dakota":"SD","Tennessee":"TN","Texas":"TX","Utah":"UT",
-    "Vermont":"VT","Virginia":"VA","Washington":"WA","West Virginia":"WV",
-    "Wisconsin":"WI","Wyoming":"WY"
-}
-
-state_abbrevs = set(us_states.values())
+print("Processing speeches...")
 
 results = []
 
-print("Processing speeches...")
+for _, row in tqdm(df.iterrows(), total=len(df)):
 
-for _, row in tqdm(df.iterrows(), total=len(df), desc="Analyzing speeches"):
+    doc = nlp(str(row["text"]))
 
-    text = str(row["text"])
-    president = row["president"]
-    year = row["year"]
+    # precompute PERSON spans (fast lookup)
+    person_spans = {(ent.start, ent.end) for ent in doc.ents if ent.label_ == "PERSON"}
 
-    doc = nlp(text)
+    seen = set()
 
-    for ent in doc.ents:
+    # -------------------------
+    # 1. PhraseMatcher (primary)
+    # -------------------------
+    for _, start, end in matcher(doc):
+        if (start, end) in seen:
+            continue
+        seen.add((start, end))
 
-        if ent.label_ == "GPE":
+        span = doc[start:end]
+        state = resolve_state(span, doc, person_spans)
 
-            # full state name
-            if ent.text in us_states:
-                state = ent.text
-                abbr = us_states[state]
-
-            # abbreviation (e.g., CA, TX)
-            elif ent.text in state_abbrevs:
-                abbr = ent.text
-                state = [k for k, v in us_states.items() if v == abbr][0]
-
-            else:
-                continue
-
+        if state:
             results.append({
                 "state": state,
-                "abbr": abbr,
-                "president": president,
-                "year": year
+                "abbr": us_states[state],
+                "president": row["president"],
+                "year": row["year"]
             })
+
+    # -------------------------
+    # 2. NER fallback
+    # -------------------------
+    for ent in doc.ents:
+        if ent.label_ == "GPE":
+            span_key = (ent.start, ent.end)
+            if span_key in seen:
+                continue
+
+            state = resolve_state(ent, doc, person_spans)
+
+            if state:
+                results.append({
+                    "state": state,
+                    "abbr": us_states[state],
+                    "president": row["president"],
+                    "year": row["year"]
+                })
 
 # -----------------------------
 # Aggregate
